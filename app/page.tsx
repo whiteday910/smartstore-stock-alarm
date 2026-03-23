@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 
 type FormStatus = "idle" | "loading" | "success" | "error" | "duplicate";
 type MonitorStatus = "IN_STOCK" | "OUT_OF_STOCK" | "UNKNOWN" | "ERROR";
@@ -11,6 +11,9 @@ type Monitor = {
   product_name: string | null;
   last_status: MonitorStatus;
   last_checked_at: string | null;
+  last_scrape_ok: boolean | null;
+  last_scrape_note: string | null;
+  last_http_status: number | null;
   notified_at: string | null;
   unsubscribe_token: string;
   created_at: string;
@@ -80,6 +83,19 @@ export default function Home() {
   const [monitors, setMonitors] = useState<Monitor[] | null>(null);
   const [queryMessage, setQueryMessage] = useState("");
   const [unsubscribing, setUnsubscribing] = useState<string | null>(null);
+
+  const [scrapeLoading, setScrapeLoading] = useState(false);
+  const [scrapeLog, setScrapeLog] = useState("");
+  const [showScrapePanel, setShowScrapePanel] = useState(false);
+
+  useEffect(() => {
+    if (process.env.NEXT_PUBLIC_ENABLE_SCRAPE_UI === "true") {
+      setShowScrapePanel(true);
+      return;
+    }
+    const h = window.location.hostname;
+    if (h === "localhost" || h === "127.0.0.1") setShowScrapePanel(true);
+  }, []);
 
   // ── 유효성 검사 ───────────────────────────────────────────
   const validateUrl = (value: string) => {
@@ -170,6 +186,27 @@ export default function Home() {
   };
 
   // ── 구독 취소 ─────────────────────────────────────────────
+  const handleScrapeNow = async () => {
+    setScrapeLoading(true);
+    setScrapeLog("");
+    try {
+      const res = await fetch("/api/scrape-now", { method: "POST" });
+      const data = await res.json();
+      if (!res.ok) {
+        setScrapeLog(data.error || `오류 (${res.status})`);
+        return;
+      }
+      setScrapeLog(data.log || "(로그 없음)");
+      if (queryEmail && validateEmail(queryEmail) === "") {
+        handleQueryMonitors(queryEmail);
+      }
+    } catch {
+      setScrapeLog("요청 실패 — 네트워크 또는 서버를 확인하세요.");
+    } finally {
+      setScrapeLoading(false);
+    }
+  };
+
   const handleUnsubscribe = async (token: string, monitorId: string) => {
     if (!confirm("이 상품의 재입고 알림을 취소하시겠습니까?")) return;
     setUnsubscribing(monitorId);
@@ -414,6 +451,35 @@ export default function Home() {
                           </span>
                         </div>
 
+                        {(m.last_scrape_ok !== null &&
+                          m.last_scrape_ok !== undefined) ||
+                        m.last_scrape_note ||
+                        m.last_http_status != null ? (
+                          <div className="mt-2 text-[11px] leading-relaxed text-gray-600 bg-white/60 rounded-lg px-2 py-1.5 border border-gray-100">
+                            <span className="font-semibold text-gray-700">
+                              스크래핑:{" "}
+                            </span>
+                            {m.last_scrape_ok === true ? (
+                              <span className="text-green-700">성공</span>
+                            ) : m.last_scrape_ok === false ? (
+                              <span className="text-red-600">실패/불명</span>
+                            ) : (
+                              <span className="text-gray-500">—</span>
+                            )}
+                            {m.last_http_status != null ? (
+                              <span className="text-gray-500">
+                                {" "}
+                                · HTTP {m.last_http_status}
+                              </span>
+                            ) : null}
+                            {m.last_scrape_note ? (
+                              <div className="mt-0.5 text-gray-500 break-words">
+                                {m.last_scrape_note}
+                              </div>
+                            ) : null}
+                          </div>
+                        ) : null}
+
                         {/* 마지막 확인 시각 */}
                         <div className="flex items-center justify-between mt-2">
                           <p className="text-xs text-gray-400">
@@ -435,6 +501,41 @@ export default function Home() {
                       </div>
                     );
                   })}
+                </div>
+              )}
+
+              {showScrapePanel && (
+                <div className="mt-6 pt-6 border-t border-gray-100">
+                  <p className="text-xs font-semibold text-gray-700 mb-2">
+                    로컬 스크래핑 (Python)
+                  </p>
+                  <p className="text-xs text-gray-500 mb-3">
+                    이 PC에서 <code className="bg-gray-100 px-1 rounded">check_stock.py</code>{" "}
+                    를 실행합니다. 터미널 로그와 동일하게 아래에 표시됩니다.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={handleScrapeNow}
+                    disabled={scrapeLoading}
+                    className="w-full btn-primary flex items-center justify-center gap-2 mb-3"
+                  >
+                    {scrapeLoading ? (
+                      <>
+                        <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
+                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                        </svg>
+                        실행 중… (최대 3분)
+                      </>
+                    ) : (
+                      "스크래핑 실행"
+                    )}
+                  </button>
+                  {scrapeLog ? (
+                    <pre className="text-[11px] leading-snug bg-gray-900 text-green-100 p-3 rounded-lg overflow-x-auto max-h-64 overflow-y-auto whitespace-pre-wrap break-all font-mono">
+                      {scrapeLog}
+                    </pre>
+                  ) : null}
                 </div>
               )}
             </div>

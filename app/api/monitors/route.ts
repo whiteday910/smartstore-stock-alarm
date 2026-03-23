@@ -21,7 +21,7 @@ export async function GET(req: NextRequest) {
   const { data, error } = await supabase
     .from("monitors")
     .select(
-      "id, url, product_name, last_status, last_checked_at, notified_at, is_active, unsubscribe_token, created_at"
+      "id, url, product_name, last_status, last_checked_at, last_scrape_ok, last_scrape_note, last_http_status, notified_at, is_active, unsubscribe_token, created_at"
     )
     .eq("email", email)
     .eq("is_active", true)

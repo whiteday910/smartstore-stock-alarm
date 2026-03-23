@@ -11,6 +11,9 @@ CREATE TABLE IF NOT EXISTS public.monitors (
     last_status        TEXT        NOT NULL DEFAULT 'UNKNOWN'
                                    CHECK (last_status IN ('IN_STOCK','OUT_OF_STOCK','UNKNOWN','ERROR')),
     last_checked_at    TIMESTAMPTZ,
+    last_scrape_ok     BOOLEAN,
+    last_scrape_note   TEXT,
+    last_http_status   INTEGER,
     notified_at        TIMESTAMPTZ,
     is_active          BOOLEAN     NOT NULL DEFAULT TRUE,
     unsubscribe_token  UUID        NOT NULL DEFAULT gen_random_uuid() UNIQUE,

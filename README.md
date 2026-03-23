@@ -114,6 +114,22 @@ npm run monitor:local
 
 터미널 2개 권장: 하나는 `npm run dev`, 다른 하나는 `npm run monitor:local`.
 
+### Supabase 컬럼 추가 (스크래핑 성공 여부)
+
+한 번만 SQL Editor 에서 실행:
+
+`supabase/migration_add_scrape_columns.sql` 내용 실행  
+(`last_scrape_ok`, `last_scrape_note`, `last_http_status`)
+
+### 웹에서 스크래핑 로그 보기 (로컬)
+
+1. `npm run dev` 후 브라우저에서 `http://localhost:3000` 접속  
+2. **내 알림 현황** 카드 하단의 **「스크래핑 실행」** 클릭  
+3. 터미널과 동일한 Python 로그가 화면에 표시됩니다.  
+4. (배포 환경에서 쓰려면 `ENABLE_SCRAPE_UI=true` 만 서버에 설정 — 보안상 기본 비권장)
+
+선택: `.env.local` 에 `NEXT_PUBLIC_ENABLE_SCRAPE_UI=true` 를 넣으면 localhost 가 아닌 주소에서도 패널을 켤 수 있습니다.
+
 ## 파일 구조
 
 ```

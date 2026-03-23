@@ -184,6 +184,94 @@ def _parse_stock_from_html(html: str, source: str = "") -> dict:
     return {"status": "UNKNOWN", "product_name": product_name}
 
 
+# ── 스크래핑 성공 여부 (HTTP 490 등 + 본문 마커) ─────────────
+def _detect_product_page_markers(html: str) -> list[str]:
+    """실제 상품 영역이 로드됐는지 판별하는 대표 문구들."""
+    keys = [
+        "재입고 시 구매가능",
+        "이 상품은 현재 구매하실 수 없는",
+        "구매하실 수 없는 상품",
+        "구매하기",
+        "장바구니 담기",
+        "바로구매",
+        "총 상품 금액",
+    ]
+    return [k for k in keys if k in html]
+
+
+def finalize_scrape_result(
+    parsed: dict,
+    http_status: Optional[int],
+    html: str,
+    source: str = "",
+) -> dict:
+    """
+    파싱 결과 + HTTP 코드 + 원문 HTML 로 스크래핑 성공 여부를 정리합니다.
+    네이버가 490 등 비표준 코드를 주어도 '재입고 시 구매가능' 이 있으면 페이지 로드 성공으로 봅니다.
+    """
+    markers = _detect_product_page_markers(html)
+    has_next = "__NEXT_DATA__" in html
+    page_looks_ok = bool(markers) or has_next
+
+    st = parsed.get("status", "UNKNOWN")
+    pn = parsed.get("product_name")
+
+    if st == "UNKNOWN":
+        if (
+            "재입고 시 구매가능" in html
+            or "이 상품은 현재 구매하실 수 없는" in html
+            or "구매하실 수 없는 상품" in html
+        ):
+            st = "OUT_OF_STOCK"
+            logger.info(
+                f"  [{source}] finalize: 품절/재입고 안내 문구로 OUT_OF_STOCK 보정"
+            )
+        elif "구매하기" in html or "장바구니 담기" in html or "바로구매" in html:
+            st = "IN_STOCK"
+            logger.info(f"  [{source}] finalize: 구매 UI 문구로 IN_STOCK 보정")
+
+    scrape_success = False
+    scrape_note = ""
+
+    if http_status == 429:
+        scrape_note = "HTTP 429 — IP/요청 차단"
+    elif st == "ERROR":
+        scrape_note = "스크래핑 실패 (모든 방법 무응답)"
+    elif st in ("IN_STOCK", "OUT_OF_STOCK"):
+        scrape_success = True
+        scrape_note = f"재고 상태 확인 OK ({st})"
+        if http_status is not None and http_status != 200:
+            scrape_note += f" | 응답 HTTP {http_status}"
+    elif page_looks_ok:
+        scrape_success = True
+        if markers:
+            scrape_note = (
+                f"상품 페이지 로드 확인 (키워드: {', '.join(markers[:4])}"
+                + ("…" if len(markers) > 4 else "")
+                + ")"
+            )
+        else:
+            scrape_note = "__NEXT_DATA__ 존재 — 페이지 로드로 간주"
+        if http_status is not None and http_status != 200:
+            scrape_note += f" | HTTP {http_status}"
+        if st == "UNKNOWN":
+            scrape_note += " | 재고만 추가 파싱 필요할 수 있음"
+    else:
+        scrape_note = "상품 페이지로 식별 불가 (차단/빈 응답 가능)"
+        if http_status is not None:
+            scrape_note += f" | HTTP {http_status}"
+
+    logger.info(f"  [스크래핑] 성공={scrape_success} | {scrape_note}")
+
+    return {
+        "status": st,
+        "product_name": pn,
+        "scrape_success": scrape_success,
+        "scrape_note": scrape_note,
+        "last_http_status": http_status,
+    }
+
+
 # ── 방법 1: Playwright 헤드리스 브라우저 ────────────────────
 def _check_via_playwright(url: str) -> Optional[dict]:
     """
@@ -227,7 +315,9 @@ def _check_via_playwright(url: str) -> Optional[dict]:
 
             try:
                 response = page.goto(url, wait_until="load", timeout=45000)
-                http_status = response.status if response else "?"
+                http_status: Optional[int] = (
+                    int(response.status) if response and response.status else None
+                )
                 logger.info(f"  [Playwright] HTTP {http_status}")
 
                 if http_status == 429:
@@ -244,7 +334,10 @@ def _check_via_playwright(url: str) -> Optional[dict]:
                 content = page.content()
                 logger.info(f"  [Playwright] 페이지 크기: {len(content):,} bytes")
 
-                return _parse_stock_from_html(content, source="Playwright")
+                parsed = _parse_stock_from_html(content, source="Playwright")
+                return finalize_scrape_result(
+                    parsed, http_status, content, source="Playwright"
+                )
 
             except PlaywrightTimeoutError:
                 logger.error("  [Playwright] 타임아웃")
@@ -275,17 +368,23 @@ def _check_via_requests(url: str) -> Optional[dict]:
     for attempt in range(1, 4):
         try:
             resp = requests.get(url, headers=headers, timeout=20, allow_redirects=True)
-            logger.info(f"  [requests] 시도 {attempt}/3 → HTTP {resp.status_code}, {len(resp.text):,} bytes")
+            logger.info(
+                f"  [requests] 시도 {attempt}/3 → HTTP {resp.status_code}, {len(resp.text):,} bytes"
+            )
 
             if resp.status_code == 429:
                 logger.warning("  [requests] HTTP 429 — 차단됨")
-                break  # 재시도해도 의미 없음
+                break
 
-            resp.raise_for_status()
-            return _parse_stock_from_html(resp.text, source="requests")
+            # 490 등 비정상 코드도 본문에 상품 UI 가 있을 수 있음
+            if resp.status_code >= 500:
+                logger.warning(f"  [requests] HTTP {resp.status_code} — 서버 오류, 재시도")
+            else:
+                parsed = _parse_stock_from_html(resp.text, source="requests")
+                return finalize_scrape_result(
+                    parsed, resp.status_code, resp.text, source="requests"
+                )
 
-        except requests.exceptions.HTTPError:
-            pass
         except Exception as e:
             logger.error(f"  [requests] 시도 {attempt}/3 예외: {type(e).__name__}: {e}")
 
@@ -338,7 +437,15 @@ def _check_via_vercel_proxy(url: str) -> Optional[dict]:
         )
 
         if status in ("IN_STOCK", "OUT_OF_STOCK", "UNKNOWN"):
-            return {"status": status, "product_name": product_name}
+            hs = http_status if isinstance(http_status, int) else None
+            parsed = {"status": status, "product_name": product_name}
+            # Vercel 경유 시 HTML 없음 — 상태만으로 성공 여부
+            hint = ""
+            if status == "OUT_OF_STOCK":
+                hint = "재입고 시 구매가능"
+            elif status == "IN_STOCK":
+                hint = "구매하기"
+            return finalize_scrape_result(parsed, hs, hint, source="Vercel")
 
         if data.get("error"):
             logger.warning(f"  [Vercel] 오류: {data['error']}")
@@ -373,7 +480,13 @@ def check_stock_status(url: str) -> dict:
         return result
 
     logger.error("  모든 방법 실패 → ERROR")
-    return {"status": "ERROR", "product_name": None}
+    return {
+        "status": "ERROR",
+        "product_name": None,
+        "scrape_success": False,
+        "scrape_note": "모든 스크래핑 방법 실패 (429/타임아웃 등)",
+        "last_http_status": None,
+    }
 
 
 # ── 재입고 알림 이메일 ───────────────────────────────────────
@@ -484,11 +597,24 @@ def main():
         product_name: Optional[str] = check_result.get("product_name")
         now = datetime.now(timezone.utc).isoformat()
 
-        logger.info(f"  최종 상태: {current_status}\n")
+        scrape_ok = check_result.get("scrape_success")
+        scrape_note = check_result.get("scrape_note")
+        http_st = check_result.get("last_http_status")
+
+        logger.info(f"  최종 상태: {current_status}")
+        logger.info(
+            f"  스크래핑: {'성공' if scrape_ok else '실패/불명'} | {scrape_note}\n"
+        )
 
         for monitor in url_monitors:
             prev_status = monitor.get("last_status", "UNKNOWN")
             monitor_id = monitor["id"]
+
+            meta = {
+                "last_scrape_ok": scrape_ok,
+                "last_scrape_note": scrape_note,
+                "last_http_status": http_st,
+            }
 
             if prev_status == "OUT_OF_STOCK" and current_status == "IN_STOCK":
                 logger.info(f"  🎉 재입고 감지! → {monitor['email']} 알림 발송 중...")
@@ -503,12 +629,14 @@ def main():
                     "last_checked_at": now,
                     "notified_at": now if sent else monitor.get("notified_at"),
                     "product_name": product_name or monitor.get("product_name"),
+                    **meta,
                 }
             else:
                 update_data = {
                     "last_status": current_status,
                     "last_checked_at": now,
                     "product_name": product_name or monitor.get("product_name"),
+                    **meta,
                 }
 
             patch_monitor(monitor_id, update_data)
