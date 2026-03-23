@@ -1,6 +1,10 @@
 """
 스마트스토어 재입고 모니터링 스크립트
 GitHub Actions 에서 주기적으로 실행됩니다.
+
+재고 확인 전략 (순서대로 시도):
+  1. Playwright 헤드리스 브라우저 (실제 Chrome 으로 봇 감지 우회)
+  2. requests fallback (Playwright 실패 시)
 """
 
 import os
@@ -17,6 +21,7 @@ from email.mime.multipart import MIMEMultipart
 
 import requests
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 from supabase import create_client, Client
 
 # ── 로깅 설정 ──────────────────────────────────────────────
@@ -38,38 +43,8 @@ BASE_URL = os.environ.get("BASE_URL", "https://localhost:3000")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 
-# ── HTTP 요청 헤더 (브라우저처럼 보이도록) ─────────────────
-BASE_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/123.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Cache-Control": "max-age=0",
-}
-
-JSON_HEADERS = {
-    "User-Agent": BASE_HEADERS["User-Agent"],
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "ko-KR,ko;q=0.9",
-    "Referer": "https://smartstore.naver.com/",
-    "Origin": "https://smartstore.naver.com",
-    "X-Requested-With": "XMLHttpRequest",
-}
-
-
-# ── 재귀 JSON 탐색 ───────────────────────────────────────────
+# ── JSON 재귀 탐색 ──────────────────────────────────────────
 def find_value_by_key(data, target_key: str, depth: int = 0):
-    """중첩 JSON 에서 특정 키를 재귀적으로 탐색합니다."""
     if depth > 15:
         return None
     if isinstance(data, dict):
@@ -87,99 +62,49 @@ def find_value_by_key(data, target_key: str, depth: int = 0):
     return None
 
 
-# ── Naver 내부 JSON API 시도 ─────────────────────────────────
-def _try_internal_api(product_id: str) -> Optional[dict]:
+# ── HTML 파싱 공통 로직 ─────────────────────────────────────
+def _parse_stock_from_html(html: str, source: str = "") -> dict:
     """
-    Naver SmartStore 내부 API (JSON) 로 상품 상태를 직접 조회합니다.
-    HTML 렌더링 없이 더 가볍고 차단 가능성이 낮습니다.
+    HTML 문자열에서 재고 상태와 상품명을 추출합니다.
+    __NEXT_DATA__ JSON 파싱 → 텍스트 패턴 순서로 시도합니다.
     """
-    # 시도할 내부 API 엔드포인트 목록
-    endpoints = [
-        f"https://smartstore.naver.com/i/v1/products/{product_id}",
-        f"https://smartstore.naver.com/main/products/{product_id}.json",
-    ]
-
-    for endpoint in endpoints:
-        try:
-            resp = requests.get(endpoint, headers=JSON_HEADERS, timeout=15)
-            logger.info(f"  [내부API] {endpoint} → HTTP {resp.status_code}")
-
-            if resp.status_code != 200:
-                continue
-
-            # JSON 응답인지 확인
-            content_type = resp.headers.get("content-type", "")
-            if "json" not in content_type and not resp.text.strip().startswith("{"):
-                continue
-
-            data = resp.json()
-            status_type = find_value_by_key(data, "statusType")
-            name = find_value_by_key(data, "name")
-
-            if status_type:
-                logger.info(f"  [내부API] statusType={status_type}, name={name}")
-                status_type = status_type.upper()
-                if status_type == "SALE":
-                    return {"status": "IN_STOCK", "product_name": name}
-                if status_type in ("OUTOFSTOCK", "SUSPENSION", "CLOSE", "SOLDOUT"):
-                    return {"status": "OUT_OF_STOCK", "product_name": name}
-
-        except Exception as e:
-            logger.debug(f"  [내부API] {endpoint} 실패: {e}")
-
-    return None
-
-
-# ── HTML 파싱으로 재고 확인 ──────────────────────────────────
-def _check_via_html(url: str, session: requests.Session) -> dict:
-    resp = session.get(url, timeout=30, allow_redirects=True)
-    logger.info(f"  [HTML] HTTP {resp.status_code}, 크기 {len(resp.text):,} bytes")
-    logger.info(f"  [HTML] 최종 URL: {resp.url}")
-
-    resp.raise_for_status()
-    html = resp.text
     product_name: Optional[str] = None
 
-    # __NEXT_DATA__ 가 없으면 차단/이상 응답으로 판단
-    if "__NEXT_DATA__" not in html:
-        logger.warning("  [HTML] __NEXT_DATA__ 없음 → 차단 또는 비정상 응답")
-        # 그래도 텍스트 패턴은 시도
+    # ── __NEXT_DATA__ JSON 파싱 ──
+    match = re.search(
+        r'<script id="__NEXT_DATA__" type="application/json">([\s\S]*?)</script>',
+        html,
+    )
+    if match:
+        try:
+            next_data = json.loads(match.group(1))
+
+            name_val = find_value_by_key(next_data, "name")
+            if name_val and isinstance(name_val, str) and len(name_val) > 1:
+                product_name = name_val
+
+            status_val = find_value_by_key(next_data, "statusType")
+            if status_val and isinstance(status_val, str):
+                status_val = status_val.upper()
+                logger.info(f"  [{source}] statusType={status_val}, name={product_name}")
+                if status_val == "SALE":
+                    return {"status": "IN_STOCK", "product_name": product_name}
+                if status_val in ("OUTOFSTOCK", "SUSPENSION", "CLOSE", "SOLDOUT"):
+                    return {"status": "OUT_OF_STOCK", "product_name": product_name}
+
+            qty = find_value_by_key(next_data, "stockQuantity")
+            if qty is not None:
+                try:
+                    q = int(qty)
+                    logger.info(f"  [{source}] stockQuantity={q}")
+                    return {"status": "IN_STOCK" if q > 0 else "OUT_OF_STOCK", "product_name": product_name}
+                except (ValueError, TypeError):
+                    pass
+
+        except json.JSONDecodeError as e:
+            logger.warning(f"  [{source}] __NEXT_DATA__ 파싱 실패: {e}")
     else:
-        # ── __NEXT_DATA__ JSON 파싱 ──
-        match = re.search(
-            r'<script id="__NEXT_DATA__" type="application/json">([\s\S]*?)</script>',
-            html,
-        )
-        if match:
-            try:
-                next_data = json.loads(match.group(1))
-                name_val = find_value_by_key(next_data, "name")
-                if name_val and isinstance(name_val, str) and len(name_val) > 1:
-                    product_name = name_val
-
-                status_val = find_value_by_key(next_data, "statusType")
-                if status_val and isinstance(status_val, str):
-                    status_val = status_val.upper()
-                    logger.info(f"  [HTML] statusType={status_val}")
-                    if status_val == "SALE":
-                        return {"status": "IN_STOCK", "product_name": product_name}
-                    if status_val in ("OUTOFSTOCK", "SUSPENSION", "CLOSE", "SOLDOUT"):
-                        return {"status": "OUT_OF_STOCK", "product_name": product_name}
-
-                qty = find_value_by_key(next_data, "stockQuantity")
-                if qty is not None:
-                    try:
-                        q = int(qty)
-                        logger.info(f"  [HTML] stockQuantity={q}")
-                        if q > 0:
-                            return {"status": "IN_STOCK", "product_name": product_name}
-                        else:
-                            return {"status": "OUT_OF_STOCK", "product_name": product_name}
-                    except (ValueError, TypeError):
-                        pass
-
-            except json.JSONDecodeError as e:
-                logger.warning(f"  [HTML] __NEXT_DATA__ JSON 파싱 실패: {e}")
+        logger.warning(f"  [{source}] __NEXT_DATA__ 없음")
 
     # ── 텍스트 패턴 fallback ──
     soup = BeautifulSoup(html, "html.parser")
@@ -193,60 +118,142 @@ def _check_via_html(url: str, session: requests.Session) -> dict:
     out_signals = ["구매하실 수 없는 상품", "현재 구매하실 수 없", "재입고 시 구매가능", "품절"]
     for sig in out_signals:
         if sig in page_text:
-            logger.info(f"  [HTML] 품절 텍스트 감지: '{sig}'")
+            logger.info(f"  [{source}] 품절 텍스트 감지: '{sig}'")
             return {"status": "OUT_OF_STOCK", "product_name": product_name}
 
     in_signals = ["구매하기", "장바구니 담기", "바로구매"]
     for sig in in_signals:
         if sig in page_text:
-            logger.info(f"  [HTML] 구매 가능 텍스트 감지: '{sig}'")
+            logger.info(f"  [{source}] 구매가능 텍스트 감지: '{sig}'")
             return {"status": "IN_STOCK", "product_name": product_name}
 
-    logger.warning("  [HTML] 상태 판별 불가 → UNKNOWN 반환")
+    logger.warning(f"  [{source}] 상태 판별 불가 → UNKNOWN")
     return {"status": "UNKNOWN", "product_name": product_name}
 
 
-# ── 메인 재고 확인 함수 (재시도 포함) ────────────────────────
-def check_stock_status(url: str) -> dict:
+# ── 방법 1: Playwright 헤드리스 브라우저 ────────────────────
+def _check_via_playwright(url: str) -> Optional[dict]:
     """
-    여러 방법을 순차적으로 시도하여 재고 상태를 확인합니다.
-    1. Naver 내부 JSON API (더 가볍고 차단 가능성 낮음)
-    2. HTML 스크래핑 (3회 재시도)
+    실제 Chrome 브라우저(헤드리스)를 사용해 봇 감지를 우회합니다.
+    webdriver 속성을 숨기고 한국어 로케일을 설정합니다.
     """
-    # ── 방법 1: 내부 JSON API ──
-    product_id_match = re.search(r"/products/(\d+)", url)
-    if product_id_match:
-        result = _try_internal_api(product_id_match.group(1))
-        if result:
-            logger.info(f"  내부 API 성공: {result['status']}")
-            return result
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                ],
+            )
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/123.0.0.0 Safari/537.36"
+                ),
+                locale="ko-KR",
+                timezone_id="Asia/Seoul",
+                viewport={"width": 1280, "height": 800},
+                extra_http_headers={
+                    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
+                },
+            )
 
-    # ── 방법 2: HTML 스크래핑 (3회 재시도) ──
-    session = requests.Session()
-    session.headers.update(BASE_HEADERS)
+            # webdriver 탐지 회피
+            context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                window.chrome = { runtime: {} };
+            """)
+
+            page = context.new_page()
+
+            try:
+                response = page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                http_status = response.status if response else "?"
+                logger.info(f"  [Playwright] HTTP {http_status}")
+
+                if http_status == 429:
+                    logger.warning("  [Playwright] HTTP 429 — IP 차단됨")
+                    return None
+
+                # JS 실행 완료 대기 (동적 렌더링 반영)
+                page.wait_for_timeout(3000)
+
+                content = page.content()
+                logger.info(f"  [Playwright] 페이지 크기: {len(content):,} bytes")
+
+                return _parse_stock_from_html(content, source="Playwright")
+
+            except PlaywrightTimeoutError:
+                logger.error("  [Playwright] 타임아웃")
+                return None
+            finally:
+                browser.close()
+
+    except Exception as e:
+        logger.error(f"  [Playwright] 예외: {type(e).__name__}: {e}")
+        return None
+
+
+# ── 방법 2: requests fallback ────────────────────────────────
+def _check_via_requests(url: str) -> Optional[dict]:
+    """requests 로 HTML 직접 요청 (Playwright 실패 시 fallback)"""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/123.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+    }
 
     for attempt in range(1, 4):
         try:
-            logger.info(f"  HTML 스크래핑 시도 {attempt}/3 ...")
-            return _check_via_html(url, session)
+            resp = requests.get(url, headers=headers, timeout=20, allow_redirects=True)
+            logger.info(f"  [requests] 시도 {attempt}/3 → HTTP {resp.status_code}, {len(resp.text):,} bytes")
 
-        except requests.exceptions.Timeout:
-            logger.error(f"  시도 {attempt}/3 타임아웃")
-        except requests.exceptions.HTTPError as e:
-            status_code = e.response.status_code if e.response else "?"
-            logger.error(f"  시도 {attempt}/3 HTTP {status_code} 오류")
-            # 4xx는 재시도해도 의미 없음
-            if e.response and 400 <= e.response.status_code < 500:
-                break
+            if resp.status_code == 429:
+                logger.warning("  [requests] HTTP 429 — 차단됨")
+                break  # 재시도해도 의미 없음
+
+            resp.raise_for_status()
+            return _parse_stock_from_html(resp.text, source="requests")
+
+        except requests.exceptions.HTTPError:
+            pass
         except Exception as e:
-            logger.error(f"  시도 {attempt}/3 예외: {type(e).__name__}: {e}")
+            logger.error(f"  [requests] 시도 {attempt}/3 예외: {type(e).__name__}: {e}")
 
         if attempt < 3:
             wait = random.uniform(3, 7)
             logger.info(f"  {wait:.1f}초 후 재시도...")
             time.sleep(wait)
 
-    logger.error(f"  모든 시도 실패 → ERROR")
+    return None
+
+
+# ── 메인 재고 확인 함수 ──────────────────────────────────────
+def check_stock_status(url: str) -> dict:
+    # 1차: Playwright
+    result = _check_via_playwright(url)
+    if result is not None:
+        return result
+
+    # 2차: requests fallback
+    logger.info("  Playwright 실패 → requests fallback 시도...")
+    result = _check_via_requests(url)
+    if result is not None:
+        return result
+
+    logger.error("  모든 방법 실패 → ERROR")
     return {"status": "ERROR", "product_name": None}
 
 
@@ -320,7 +327,6 @@ def send_restock_email(
 
 # ── 메인 ─────────────────────────────────────────────────────
 def main():
-    # 0~300초 랜덤 딜레이 (15분 cron + 0~5분 딜레이 = 실질적 15~20분 간격)
     delay_seconds = random.randint(0, 300)
     logger.info(f"랜덤 딜레이 {delay_seconds}초 대기 중...")
     time.sleep(delay_seconds)
@@ -338,7 +344,6 @@ def main():
 
     logger.info(f"활성 모니터 {len(monitors)}개")
 
-    # URL 별로 그룹화 (동일 URL 은 한 번만 요청)
     url_map: dict[str, list[dict]] = {}
     for m in monitors:
         url_map.setdefault(m["url"], []).append(m)
