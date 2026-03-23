@@ -1,0 +1,38 @@
+name: 재고 모니터링
+
+on:
+  # 매 15분마다 실행 (스크립트 내부에서 0~5분 랜덤 딜레이 추가 → 실질적 15~20분 간격)
+  schedule:
+    - cron: "*/15 * * * *"
+
+  # 수동 실행 버튼 (테스트용)
+  workflow_dispatch:
+
+jobs:
+  check-stock:
+    name: 재고 상태 확인
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 저장소 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: scripts/requirements.txt
+
+      - name: 의존성 설치
+        run: pip install -r scripts/requirements.txt
+
+      - name: 재고 모니터링 실행
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          BASE_URL: ${{ secrets.BASE_URL }}
+        run: python scripts/check_stock.py

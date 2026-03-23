@@ -1,0 +1,28 @@
+# 의존성
+node_modules/
+
+# 빌드 결과물
+.next/
+out/
+
+# 환경변수 (절대 커밋하면 안 됩니다!)
+.env
+.env.local
+.env.*.local
+
+# 로그
+npm-debug.log*
+
+# 에디터
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/
