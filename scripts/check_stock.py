@@ -272,46 +272,100 @@ def finalize_scrape_result(
     }
 
 
-# ── 방법 1: Playwright 헤드리스 브라우저 ────────────────────
+# ── Playwright: 시스템 Chrome / CDP ─────────────────────────
+_STEALTH_INIT_JS = """
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+window.chrome = { runtime: {} };
+"""
+
+
+def _playwright_headless() -> bool:
+    v = os.environ.get("PLAYWRIGHT_HEADLESS", "true").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
 def _check_via_playwright(url: str) -> Optional[dict]:
     """
-    실제 Chrome 브라우저(헤드리스)를 사용해 봇 감지를 우회합니다.
-    webdriver 속성을 숨기고 한국어 로케일을 설정합니다.
+    OS 에 설치된 Google Chrome 을 우선 사용합니다 (Playwright channel=\"chrome\").
+    Chrome 이 없으면 Playwright 가 설치한 Chromium 으로 폴백합니다.
+
+    선택: PLAYWRIGHT_CDP_URL=http://127.0.0.1:9222
+      → 이미 띄워 둔 Chrome (--remote-debugging-port=9222) 에 붙어 조회합니다.
+    선택: PLAYWRIGHT_HEADLESS=false → Chrome 창이 보이게 실행 (디버깅)
     """
+    cdp_url = os.environ.get("PLAYWRIGHT_CDP_URL", "").strip()
+    headless = _playwright_headless()
+
+    launch_args = [
+        "--disable-blink-features=AutomationControlled",
+        "--disable-dev-shm-usage",
+    ]
+    if os.name != "nt":
+        launch_args.extend(["--no-sandbox", "--disable-setuid-sandbox"])
+
+    context_opts = {
+        "locale": "ko-KR",
+        "timezone_id": "Asia/Seoul",
+        "viewport": {"width": 1280, "height": 800},
+        "user_agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "extra_http_headers": {
+            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
+        },
+    }
+
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                ],
-            )
-            context = browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/123.0.0.0 Safari/537.36"
-                ),
-                locale="ko-KR",
-                timezone_id="Asia/Seoul",
-                viewport={"width": 1280, "height": 800},
-                extra_http_headers={
-                    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
-                },
-            )
+            browser = None
+            context = None
+            page = None
+            via_cdp = False
 
-            # webdriver 탐지 회피
-            context.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-                window.chrome = { runtime: {} };
-            """)
+            if cdp_url:
+                logger.info(f"  [Playwright] CDP 로 실행 중인 Chrome 에 연결: {cdp_url}")
+                browser = p.chromium.connect_over_cdp(cdp_url)
+                if not browser.contexts:
+                    logger.error("  [Playwright] CDP: 브라우저 컨텍스트가 없습니다.")
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+                    return None
+                context = browser.contexts[0]
+                page = context.new_page()
+                page.add_init_script(_STEALTH_INIT_JS)
+                via_cdp = True
+                logger.info("  [Playwright] 모드: CDP (기존 Chrome 프로필/세션)")
+            else:
+                try:
+                    logger.info(
+                        f"  [Playwright] 시스템 Google Chrome 사용 (channel=chrome, headless={headless})"
+                    )
+                    browser = p.chromium.launch(
+                        channel="chrome",
+                        headless=headless,
+                        args=launch_args + (["--disable-gpu"] if headless else []),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"  [Playwright] 시스템 Chrome 실행 실패 → 번들 Chromium 사용: {e}"
+                    )
+                    browser = p.chromium.launch(
+                        headless=headless,
+                        args=launch_args
+                        + ["--disable-gpu", "--no-sandbox", "--disable-setuid-sandbox"],
+                    )
+                    logger.info(
+                        f"  [Playwright] 모드: Chromium 번들 (headless={headless})"
+                    )
 
-            page = context.new_page()
+                context = browser.new_context(**context_opts)
+                context.add_init_script(_STEALTH_INIT_JS)
+                page = context.new_page()
 
             try:
                 response = page.goto(url, wait_until="load", timeout=45000)
@@ -324,11 +378,12 @@ def _check_via_playwright(url: str) -> Optional[dict]:
                     logger.warning("  [Playwright] HTTP 429 — IP 차단됨")
                     return None
 
-                # Next.js 가 __NEXT_DATA__ 를 주입할 때까지 대기 (없으면 추가 대기)
                 try:
                     page.wait_for_selector("script#__NEXT_DATA__", timeout=25000)
                 except PlaywrightTimeoutError:
-                    logger.warning("  [Playwright] __NEXT_DATA__ 대기 타임아웃 — 추가 5초 대기")
+                    logger.warning(
+                        "  [Playwright] __NEXT_DATA__ 대기 타임아웃 — 추가 5초 대기"
+                    )
                     page.wait_for_timeout(5000)
 
                 content = page.content()
@@ -343,7 +398,16 @@ def _check_via_playwright(url: str) -> Optional[dict]:
                 logger.error("  [Playwright] 타임아웃")
                 return None
             finally:
-                browser.close()
+                try:
+                    if via_cdp and page:
+                        page.close()
+                except Exception:
+                    pass
+                try:
+                    if browser:
+                        browser.close()
+                except Exception:
+                    pass
 
     except Exception as e:
         logger.error(f"  [Playwright] 예외: {type(e).__name__}: {e}")

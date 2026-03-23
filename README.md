@@ -101,6 +101,15 @@ Python 스크립트는 **프로젝트 루트의 `.env.local`** 을 자동으로 
 ```bash
 pip install -r scripts/requirements.txt
 playwright install chromium
+# 로컬 PC 에 **Google Chrome** 이 설치되어 있으면 스크래핑 시 자동으로 그 Chrome 을 사용합니다.
+# (없으면 위로 설치한 Playwright Chromium 으로 폴백)
+
+# Chrome 창을 보면서 디버깅하려면 `.env.local` 에:
+# PLAYWRIGHT_HEADLESS=false
+
+# 이미 켜 둔 Chrome(쿠키·로그인 유지)에 붙으려면 Chrome 을 다음으로 실행한 뒤
+# `.env.local` 에 PLAYWRIGHT_CDP_URL=http://127.0.0.1:9222
+#   Windows 예: "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222
 npm run monitor:once
 # 또는: python scripts/check_stock.py
 ```
