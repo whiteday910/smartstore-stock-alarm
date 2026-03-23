@@ -79,26 +79,40 @@ git push -u origin main
 
 ## 로컬 개발
 
+네이버는 **데이터센터 IP**(GitHub Actions, Vercel 등)를 차단하는 경우가 많습니다.  
+**집·사무실 PC**에서 Python 스크립트를 돌리면 `429` 없이 스크래핑될 가능성이 높습니다.
+
+### 웹 UI + 환경변수
+
 ```bash
-# 의존성 설치
 npm install
-
-# .env.local 파일 생성 (.env.example 참고)
-cp .env.example .env.local
-
-# 개발 서버 실행
-npm run dev
+cp .env.example .env.local   # 값 수정
+npm run dev                  # http://localhost:3000
 ```
 
-Python 스크립트 로컬 테스트:
+`.env.local` 에 `SUPABASE_*`, `GMAIL_*`, `NEXT_PUBLIC_BASE_URL=http://localhost:3000` 를 넣습니다.  
+Python 스크립트는 **프로젝트 루트의 `.env.local`** 을 자동으로 읽습니다.
+
+> Python 쪽 DB 접속은 `supabase` 패키지 대신 **PostgREST + `requests`** 만 사용합니다.  
+> (Windows 에서 최신 `supabase-py` 가 `pyiceberg` C++ 빌드를 요구해 설치가 실패하는 경우가 있어 제거했습니다.)
+
+### 재고 확인 (1회)
 
 ```bash
-cd scripts
-pip install -r requirements.txt
-
-# 환경변수 설정 후
-python check_stock.py
+pip install -r scripts/requirements.txt
+playwright install chromium
+npm run monitor:once
+# 또는: python scripts/check_stock.py
 ```
+
+### 재고 확인 (15~20분 간격 반복)
+
+```bash
+npm run monitor:local
+# 또는: python scripts/run_local_monitor.py
+```
+
+터미널 2개 권장: 하나는 `npm run dev`, 다른 하나는 `npm run monitor:local`.
 
 ## 파일 구조
 
@@ -117,7 +131,8 @@ smartstore-stock-alarm/
 │   ├── supabase.ts            # Supabase 클라이언트
 │   └── email.ts               # 이메일 전송 (nodemailer)
 ├── scripts/
-│   ├── check_stock.py         # 재고 확인 Python 스크립트
+│   ├── check_stock.py         # 재고 확인 (CI / 로컬 공통)
+│   ├── run_local_monitor.py   # 로컬 15~20분 반복 모니터링
 │   └── requirements.txt
 ├── supabase/
 │   └── schema.sql             # DB 스키마

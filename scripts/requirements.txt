@@ -1,5 +1,7 @@
 requests>=2.31.0
 beautifulsoup4>=4.12.3
-supabase>=2.7.0
 lxml>=5.1.0
 playwright>=1.43.0
+python-dotenv>=1.0.0
+# supabase-py 는 Windows 에서 pyiceberg(C++ 빌드) 의존으로 설치 실패할 수 있어
+# PostgREST 는 requests 로 직접 호출합니다.

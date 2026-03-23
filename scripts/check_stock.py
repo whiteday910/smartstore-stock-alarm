@@ -1,10 +1,8 @@
 """
 스마트스토어 재입고 모니터링 스크립트
-GitHub Actions 에서 주기적으로 실행됩니다.
 
-재고 확인 전략 (순서대로 시도):
-  1. Playwright 헤드리스 브라우저 (실제 Chrome 으로 봇 감지 우회)
-  2. requests fallback (Playwright 실패 시)
+• GitHub Actions: Vercel 프록시 → Playwright → requests
+• 로컬(PC): .env.local 로드 후 Playwright → requests (Vercel 생략, 가정용 IP 사용)
 """
 
 import os
@@ -15,14 +13,23 @@ import random
 import smtplib
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
 import requests
+from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-from supabase import create_client, Client
+
+# ── 프로젝트 루트 .env / .env.local 로드 (로컬 실행용) ─────
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(_PROJECT_ROOT / ".env", override=False)
+load_dotenv(_PROJECT_ROOT / ".env.local", override=True)
+
+# GitHub Actions 에서만 True (Azure IP → 네이버 429)
+RUNNING_IN_CI = os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
 
 # ── 로깅 설정 ──────────────────────────────────────────────
 logging.basicConfig(
@@ -33,15 +40,58 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _public_base_url() -> str:
+    """구독취소 링크 등에 사용 (로컬은 NEXT_PUBLIC_BASE_URL 또는 localhost)."""
+    u = (
+        os.environ.get("BASE_URL")
+        or os.environ.get("NEXT_PUBLIC_BASE_URL")
+        or "http://localhost:3000"
+    ).strip()
+    return u.rstrip("/")
+
+
 # ── 환경변수 ────────────────────────────────────────────────
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 GMAIL_USER = os.environ["GMAIL_USER"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
-BASE_URL = os.environ.get("BASE_URL", "")
+# CI 에서만 Vercel 프록시용 (로컬은 보통 비워 둠)
+BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
 CHECK_API_SECRET = os.environ.get("CHECK_API_SECRET", "")
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
+def _sb_headers() -> dict:
+    """Supabase PostgREST 공통 헤더 (supabase-py 없이 requests 만 사용)."""
+    return {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+    }
+
+
+def fetch_active_monitors() -> list:
+    url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/monitors"
+    r = requests.get(
+        url,
+        headers=_sb_headers(),
+        params={"select": "*", "is_active": "eq.true"},
+        timeout=60,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def patch_monitor(monitor_id: str, data: dict) -> None:
+    url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/monitors"
+    r = requests.patch(
+        url,
+        headers=_sb_headers(),
+        params={"id": f"eq.{monitor_id}"},
+        json=data,
+        timeout=60,
+    )
+    r.raise_for_status()
 
 
 # ── JSON 재귀 탐색 ──────────────────────────────────────────
@@ -110,6 +160,8 @@ def _parse_stock_from_html(html: str, source: str = "") -> dict:
     # ── 텍스트 패턴 fallback ──
     soup = BeautifulSoup(html, "html.parser")
     page_text = soup.get_text()
+    # <script> 안의 JSON(예: __NEXT_DATA__) 은 get_text() 에 안 잡히므로 원본 html 도 검사
+    combined_text = page_text + "\n" + html
 
     if not product_name:
         og = soup.find("meta", property="og:title")
@@ -118,13 +170,13 @@ def _parse_stock_from_html(html: str, source: str = "") -> dict:
 
     out_signals = ["구매하실 수 없는 상품", "현재 구매하실 수 없", "재입고 시 구매가능", "품절"]
     for sig in out_signals:
-        if sig in page_text:
+        if sig in combined_text:
             logger.info(f"  [{source}] 품절 텍스트 감지: '{sig}'")
             return {"status": "OUT_OF_STOCK", "product_name": product_name}
 
     in_signals = ["구매하기", "장바구니 담기", "바로구매"]
     for sig in in_signals:
-        if sig in page_text:
+        if sig in combined_text:
             logger.info(f"  [{source}] 구매가능 텍스트 감지: '{sig}'")
             return {"status": "IN_STOCK", "product_name": product_name}
 
@@ -174,7 +226,7 @@ def _check_via_playwright(url: str) -> Optional[dict]:
             page = context.new_page()
 
             try:
-                response = page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                response = page.goto(url, wait_until="load", timeout=45000)
                 http_status = response.status if response else "?"
                 logger.info(f"  [Playwright] HTTP {http_status}")
 
@@ -182,8 +234,12 @@ def _check_via_playwright(url: str) -> Optional[dict]:
                     logger.warning("  [Playwright] HTTP 429 — IP 차단됨")
                     return None
 
-                # JS 실행 완료 대기 (동적 렌더링 반영)
-                page.wait_for_timeout(3000)
+                # Next.js 가 __NEXT_DATA__ 를 주입할 때까지 대기 (없으면 추가 대기)
+                try:
+                    page.wait_for_selector("script#__NEXT_DATA__", timeout=25000)
+                except PlaywrightTimeoutError:
+                    logger.warning("  [Playwright] __NEXT_DATA__ 대기 타임아웃 — 추가 5초 대기")
+                    page.wait_for_timeout(5000)
 
                 content = page.content()
                 logger.info(f"  [Playwright] 페이지 크기: {len(content):,} bytes")
@@ -296,15 +352,17 @@ def _check_via_vercel_proxy(url: str) -> Optional[dict]:
 # ── 메인 재고 확인 함수 ──────────────────────────────────────
 def check_stock_status(url: str) -> dict:
     """
-    1. Vercel 프록시 (Cloudflare IP — 네이버 차단 우회 가능)
-    2. Playwright 헤드리스 브라우저
-    3. requests fallback
+    CI(GitHub Actions): Vercel 프록시 → Playwright → requests
+    로컬: Playwright → requests (가정/사무실 IP, Vercel 생략)
     """
-    result = _check_via_vercel_proxy(url)
-    if result is not None:
-        return result
+    if RUNNING_IN_CI:
+        result = _check_via_vercel_proxy(url)
+        if result is not None:
+            return result
+        logger.info("  Vercel 프록시 실패 → Playwright 시도...")
+    else:
+        logger.info("  [로컬] Vercel 프록시 생략 → 이 PC IP로 Playwright 시도...")
 
-    logger.info("  Vercel 프록시 실패 → Playwright 시도...")
     result = _check_via_playwright(url)
     if result is not None:
         return result
@@ -326,7 +384,7 @@ def send_restock_email(
     unsubscribe_token: str,
 ) -> bool:
     product_display = product_name or "모니터링 중이던 상품"
-    unsubscribe_url = f"{BASE_URL}/api/unsubscribe/{unsubscribe_token}"
+    unsubscribe_url = f"{_public_base_url()}/api/unsubscribe/{unsubscribe_token}"
 
     html_body = f"""<!DOCTYPE html>
 <html>
@@ -388,16 +446,19 @@ def send_restock_email(
 
 # ── 메인 ─────────────────────────────────────────────────────
 def main():
-    delay_seconds = random.randint(0, 300)
-    logger.info(f"랜덤 딜레이 {delay_seconds}초 대기 중...")
-    time.sleep(delay_seconds)
+    # CI 만 0~5분 랜덤 지연 (cron 과 겹쳐 실질 15~20분 간격). 로컬은 바로 실행.
+    if RUNNING_IN_CI:
+        delay_seconds = random.randint(0, 300)
+        logger.info(f"랜덤 딜레이 {delay_seconds}초 대기 중...")
+        time.sleep(delay_seconds)
+    else:
+        logger.info("[로컬] 시작 지연 없음 — 즉시 모니터링")
 
     logger.info("=" * 55)
     logger.info("재고 모니터링 시작")
     logger.info("=" * 55)
 
-    result = supabase.table("monitors").select("*").eq("is_active", True).execute()
-    monitors = result.data
+    monitors = fetch_active_monitors()
 
     if not monitors:
         logger.info("활성 모니터가 없습니다. 종료합니다.")
@@ -450,7 +511,7 @@ def main():
                     "product_name": product_name or monitor.get("product_name"),
                 }
 
-            supabase.table("monitors").update(update_data).eq("id", monitor_id).execute()
+            patch_monitor(monitor_id, update_data)
 
     logger.info("=" * 55)
     logger.info("재고 모니터링 완료")
