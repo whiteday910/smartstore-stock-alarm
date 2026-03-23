@@ -38,4 +38,5 @@ jobs:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           BASE_URL: ${{ secrets.BASE_URL }}
+          CHECK_API_SECRET: ${{ secrets.CHECK_API_SECRET }}
         run: python scripts/check_stock.py

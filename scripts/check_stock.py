@@ -38,7 +38,8 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 GMAIL_USER = os.environ["GMAIL_USER"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
-BASE_URL = os.environ.get("BASE_URL", "https://localhost:3000")
+BASE_URL = os.environ.get("BASE_URL", "")
+CHECK_API_SECRET = os.environ.get("CHECK_API_SECRET", "")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
@@ -240,14 +241,74 @@ def _check_via_requests(url: str) -> Optional[dict]:
     return None
 
 
+# ── 방법 0: Vercel 프록시 ────────────────────────────────────
+def _check_via_vercel_proxy(url: str) -> Optional[dict]:
+    """
+    배포된 Vercel 앱을 프록시로 사용합니다.
+    GitHub Actions(Azure IP)는 Naver에 차단되지만,
+    Vercel(Cloudflare IP)은 차단되지 않을 가능성이 높습니다.
+    """
+    if not BASE_URL or not CHECK_API_SECRET:
+        logger.info("  [Vercel] BASE_URL 또는 CHECK_API_SECRET 미설정 → 건너뜀")
+        return None
+
+    try:
+        proxy_url = f"{BASE_URL}/api/check-url"
+        resp = requests.get(
+            proxy_url,
+            params={"url": url},
+            headers={"x-check-secret": CHECK_API_SECRET},
+            timeout=30,
+        )
+        logger.info(f"  [Vercel] HTTP {resp.status_code}")
+
+        if resp.status_code == 401:
+            logger.error("  [Vercel] 인증 실패 — CHECK_API_SECRET 확인 필요")
+            return None
+
+        if resp.status_code != 200:
+            logger.warning(f"  [Vercel] 응답 오류: {resp.status_code}")
+            return None
+
+        data = resp.json()
+        status = data.get("status")
+        product_name = data.get("product_name")
+        http_status = data.get("http_status", "?")
+        html_size = data.get("html_size", 0)
+
+        logger.info(
+            f"  [Vercel] Naver HTTP={http_status}, "
+            f"status={status}, name={product_name}, html={html_size:,}bytes"
+        )
+
+        if status in ("IN_STOCK", "OUT_OF_STOCK", "UNKNOWN"):
+            return {"status": status, "product_name": product_name}
+
+        if data.get("error"):
+            logger.warning(f"  [Vercel] 오류: {data['error']}")
+
+    except Exception as e:
+        logger.error(f"  [Vercel] 예외: {type(e).__name__}: {e}")
+
+    return None
+
+
 # ── 메인 재고 확인 함수 ──────────────────────────────────────
 def check_stock_status(url: str) -> dict:
-    # 1차: Playwright
+    """
+    1. Vercel 프록시 (Cloudflare IP — 네이버 차단 우회 가능)
+    2. Playwright 헤드리스 브라우저
+    3. requests fallback
+    """
+    result = _check_via_vercel_proxy(url)
+    if result is not None:
+        return result
+
+    logger.info("  Vercel 프록시 실패 → Playwright 시도...")
     result = _check_via_playwright(url)
     if result is not None:
         return result
 
-    # 2차: requests fallback
     logger.info("  Playwright 실패 → requests fallback 시도...")
     result = _check_via_requests(url)
     if result is not None:
